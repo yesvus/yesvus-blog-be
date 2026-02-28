@@ -1,6 +1,6 @@
 # FastAPI Blog Backend
 
-Backend-only blog API with async PostgreSQL access, JWT auth, and Alembic migrations.
+Backend-only blog API with async PostgreSQL access, JWT auth, and AWS-ready media upload flow.
 
 ## Tech Stack
 
@@ -8,96 +8,92 @@ Backend-only blog API with async PostgreSQL access, JWT auth, and Alembic migrat
 - PostgreSQL
 - SQLAlchemy 2.x (async)
 - Alembic
-- Pydantic + pydantic-settings
 - JWT (`python-jose`) + password hashing (`passlib[bcrypt]`)
-- `uv` for environment and dependency management
-- Docker + Docker Compose
+- S3 presigned uploads + CloudFront image delivery
+- Terraform for AWS infrastructure
+- GitHub Actions for CI/CD
 
-## Project Structure
+## API Overview
 
-```text
-app/
-  api/
-    deps.py            # shared API dependencies (current user resolver)
-    v1/
-      auth.py          # register/login routes
-      posts.py         # post create/list routes
-  core/
-    config.py          # .env-driven settings
-    security.py        # hashing + JWT create/decode
-  db/
-    base.py            # SQLAlchemy declarative base
-    session.py         # async engine/session + get_db dependency
-  models/              # SQLAlchemy models (User, Post)
-  schemas/             # API contracts (Pydantic)
-  main.py              # app entrypoint + global DB exception handler
-migrations/
-  env.py               # Alembic config + model metadata registration
-  versions/            # migration files
-```
+### Auth
 
-## Architecture Flow
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
 
-1. Request enters FastAPI route in `app/api/v1/*`.
-2. Route validates payload with `schemas/*`.
-3. Route gets `AsyncSession` from `get_db` dependency (`app/db/session.py`).
-4. Route executes ORM queries on `models/*`.
-5. Response is serialized with response schema contracts.
+### Posts
 
-## Auth Flow (OAuth2 Password + JWT)
+- `POST /api/v1/posts` (auth required)
+- `PUT /api/v1/posts/{post_id}` (auth required)
+- `GET /api/v1/posts`
 
-1. `POST /api/v1/auth/register` creates user with bcrypt-hashed password.
-2. `POST /api/v1/auth/login` validates credentials and returns JWT access token.
-3. Protected routes use `OAuth2PasswordBearer` token extraction.
-4. `get_current_user` decodes JWT, resolves user from DB, and injects it.
+`Post` now supports optional image metadata:
 
-## Database & Migrations
+- `image_key`
+- `image_url`
+- `image_alt`
 
-- Models are imported in `migrations/env.py`, so Alembic autogenerate can detect schema changes.
-- Initial migration exists in `migrations/versions/20260228_0001_init.py`.
+### Media
 
-Common commands:
+- `POST /api/v1/media/presign-upload` (auth required)
+  - input: `filename`, `content_type`, optional `content_length`
+  - output: `upload_url`, `key`, `image_url`, `expires_in`
+- `DELETE /api/v1/media/{key}` (auth required)
 
-```bash
-uv run alembic revision --autogenerate -m "message"
-uv run alembic upgrade head
-uv run alembic downgrade -1
-```
+### Health Endpoints
+
+- `GET /health`
+- `GET /ready` (checks DB connectivity)
+
+## Upload Flow
+
+1. Client calls `POST /api/v1/media/presign-upload`.
+2. Client uploads file directly to S3 using returned `upload_url`.
+3. Client sends `image_key`/`image_url` in post create or update payload.
+4. Public image is served through CloudFront.
+
+## Configuration
+
+Copy `.env.example` to `.env` and update values.
+
+New AWS/media settings:
+
+- `AWS_REGION`
+- `S3_BUCKET_NAME`
+- `CLOUDFRONT_DOMAIN`
+- `MEDIA_PRESIGN_EXPIRE_SECONDS`
+- `MAX_UPLOAD_SIZE_BYTES`
+- `ALLOWED_IMAGE_TYPES`
 
 ## Local Development
 
-1. Copy env file: `cp .env.example .env`
-2. Use supported Python (`3.12` or `3.13`)
-3. Create venv: `uv venv --python 3.12`
-4. Install deps: `uv sync`
-5. Run migrations: `uv run alembic upgrade head`
-6. Start API: `uv run uvicorn app.main:app --reload`
+1. `cp .env.example .env`
+2. `uv venv --python 3.12`
+3. `uv sync --group dev`
+4. `uv run alembic upgrade head`
+5. `uv run uvicorn app.main:app --reload`
 
-Health check: `GET /health`
+## Tests
+
+```bash
+uv run pytest
+```
 
 ## Docker
-
-Run full stack:
 
 ```bash
 docker compose up --build
 ```
 
-- API: `http://localhost:8000`
-- DB: `localhost:5432`
+## Terraform Deployment
 
-Container uses a non-root user for runtime security.
+See [`infra/README.md`](infra/README.md) for `dev`/`prod` environment details.
 
-## Smoke Test
+## CI/CD
 
-After the API is running:
+GitHub Actions workflow: `.github/workflows/ci-cd.yml`
 
-```bash
-./scripts/smoke_test.sh
-```
-
-Optional custom base URL:
-
-```bash
-./scripts/smoke_test.sh http://localhost:8000
-```
+- Runs tests
+- Builds and pushes image to ECR
+- Applies Terraform
+- Runs Alembic migration as one-off ECS task
+- Scales ECS service to target desired count

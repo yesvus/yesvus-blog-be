@@ -1,0 +1,152 @@
+name: ci-cd
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    env:
+      AWS_REGION: eu-central-1
+      TARGET_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Resolve environment secrets
+        run: |
+          if [ "${TARGET_ENV}" = "prod" ]; then
+            echo "TF_VAR_db_password=${{ secrets.DB_PASSWORD_PROD }}" >> "$GITHUB_ENV"
+            echo "TF_VAR_secret_key=${{ secrets.SECRET_KEY_PROD }}" >> "$GITHUB_ENV"
+            echo "TF_VAR_s3_bucket_name=${{ secrets.S3_BUCKET_NAME_PROD }}" >> "$GITHUB_ENV"
+            echo "FINAL_DESIRED_COUNT=1" >> "$GITHUB_ENV"
+          else
+            echo "TF_VAR_db_password=${{ secrets.DB_PASSWORD_DEV }}" >> "$GITHUB_ENV"
+            echo "TF_VAR_secret_key=${{ secrets.SECRET_KEY_DEV }}" >> "$GITHUB_ENV"
+            echo "TF_VAR_s3_bucket_name=${{ secrets.S3_BUCKET_NAME_DEV }}" >> "$GITHUB_ENV"
+            echo "FINAL_DESIRED_COUNT=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Terraform init
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: terraform init
+
+      - name: Terraform apply bootstrap (scale 0)
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_uri=public.ecr.aws/docker/library/python:3.12-slim" \
+            -var="ecs_desired_count=0"
+
+      - name: Export bootstrap outputs
+        id: tf_repo
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: |
+          echo "repo_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          IMAGE_URI: ${{ steps.tf_repo.outputs.repo_url }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Terraform apply image update (still scale 0)
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_uri=${IMAGE_URI}" \
+            -var="ecs_desired_count=0"
+
+      - name: Export runtime outputs
+        id: tf_runtime
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: |
+          echo "cluster_name=$(terraform output -raw ecs_cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "task_definition_arn=$(terraform output -raw ecs_task_definition_arn)" >> "$GITHUB_OUTPUT"
+          echo "container_name=$(terraform output -raw ecs_container_name)" >> "$GITHUB_OUTPUT"
+          echo "subnet_ids=$(terraform output -json public_subnet_ids | jq -r 'join(\",\")')" >> "$GITHUB_OUTPUT"
+          echo "security_group_id=$(terraform output -raw ecs_security_group_id)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Alembic migrations on one-off ECS task
+        env:
+          CLUSTER_NAME: ${{ steps.tf_runtime.outputs.cluster_name }}
+          TASK_DEFINITION_ARN: ${{ steps.tf_runtime.outputs.task_definition_arn }}
+          CONTAINER_NAME: ${{ steps.tf_runtime.outputs.container_name }}
+          SUBNET_IDS: ${{ steps.tf_runtime.outputs.subnet_ids }}
+          SECURITY_GROUP_ID: ${{ steps.tf_runtime.outputs.security_group_id }}
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER_NAME" \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"$CONTAINER_NAME\",\"command\":[\"sh\",\"-c\",\"uv run alembic upgrade head\"]}]}" \
+            --query 'tasks[0].taskArn' --output text)
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER_NAME" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER_NAME" \
+            --tasks "$TASK_ARN" \
+            --query "tasks[0].containers[0].exitCode" --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Migration task failed with exit code: $EXIT_CODE"
+            exit 1
+          fi
+
+      - name: Terraform apply final desired count
+        working-directory: infra/envs/${{ env.TARGET_ENV }}
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_uri=${IMAGE_URI}" \
+            -var="ecs_desired_count=${FINAL_DESIRED_COUNT}"

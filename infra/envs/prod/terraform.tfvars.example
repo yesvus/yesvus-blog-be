@@ -1,0 +1,5 @@
+image_uri      = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/yesvus-blog-prod-api:latest"
+s3_bucket_name = "yesvus-blog-prod-images"
+db_password    = "replace-with-strong-password"
+secret_key     = "replace-with-strong-secret"
+cors_allowed_origins = ["*"]

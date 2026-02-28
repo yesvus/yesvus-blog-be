@@ -44,3 +44,10 @@ uv.lock
 # Runtime data
 *.pid
 *.sqlite3
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
