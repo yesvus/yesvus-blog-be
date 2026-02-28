@@ -51,3 +51,4 @@ uv.lock
 *.tfstate
 *.tfstate.*
 crash.log
+*.tfvars

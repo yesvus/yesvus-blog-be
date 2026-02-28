@@ -40,7 +40,7 @@ variable "max_allocated_storage" {
 
 variable "engine_version" {
   type    = string
-  default = "16.4"
+  default = "16.13"
 }
 
 variable "parameter_group_family" {
